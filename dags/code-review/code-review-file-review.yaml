@@ -1,0 +1,71 @@
+# 单文件评审子 DAG（由主 DAG parallel 扇出）
+# 入口文档：勿写 name（由文件名 code-review-file-review 决定）
+
+type: graph
+description: Review a single changed file in a PR
+tags:
+  - code-review
+  - subdag
+
+worker_selector:
+  role: code-review
+
+params:
+  - name: repo
+    type: string
+    default: ""
+  - name: pr_number
+    type: string
+    default: ""
+  - name: file
+    type: string
+    required: true
+    default: ""
+  - name: review_mode
+    type: string
+    default: full
+  - name: workspace
+    type: string
+    default: ""
+
+env:
+  - SCRIPTS: ${SCRIPTS_DIR}
+  - file: ${params.file}
+  - repo: ${params.repo}
+  - pr_number: ${params.pr_number}
+  - review_mode: ${params.review_mode}
+
+timeout_sec: 900
+
+steps:
+  - id: analyze_file
+    name: analyze_file
+    description: 静态/语义分析单文件
+    run: |
+      bash "${SCRIPTS}/04_analyze_file.sh" --file "${params.file}"
+    outputs:
+      - name: analysis
+
+  - id: llm_review
+    name: llm_review
+    description: LLM 评审（quick 模式可跳过）
+    depends: [analyze_file]
+    preconditions:
+      - condition: "${params.review_mode}"
+        expected: "quick"
+        negate: true
+    continue_on:
+      skipped: true
+    run: |
+      bash "${SCRIPTS}/04_llm_review.sh" --file "${params.file}"
+    outputs:
+      - name: llm_findings
+
+  - id: emit_file_result
+    name: emit_file_result
+    description: 写出该文件的评审结果
+    depends: [analyze_file, llm_review]
+    run: |
+      bash "${SCRIPTS}/04_emit_file_result.sh" --file "${params.file}"
+    outputs:
+      - name: file_result

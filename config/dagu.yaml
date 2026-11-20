@@ -1,0 +1,48 @@
+# 主 Dagu（工作站）配置
+# 默认路径也可通过环境变量覆盖，见 ecosystem.config.js
+
+host: "0.0.0.0"
+port: 8080
+
+dags: ./dags
+
+# 持久化目录（主实例侧）：历史、状态、日志镜像
+paths:
+  data_dir: ./data/hub
+  # 分布式状态下 Worker 通过 gRPC 回写的状态落在这里
+  # dag_state_dir 默认 = {data_dir}/dag-state
+
+# Coordinator：供独立 Worker 连接
+coordinator:
+  host: "0.0.0.0"
+  port: 50055
+  # 多机部署时改成 Worker 可达的主机名/IP
+  # advertise: "dagu-hub.internal"
+
+# 未指定 worker_selector 的 DAG 默认本地执行；
+# 业务 DAG 一律显式声明 worker_selector，避免误跑在主进程。
+default_execution_mode: local
+
+# 全局队列：同一 DAG 可并发多个实例（不同仓库/PR）
+queues:
+  enabled: true
+  config:
+    - name: code-review
+      max_concurrency: 20
+    - name: knowledge-build
+      max_concurrency: 5
+    - name: knowledge-qa
+      max_concurrency: 10
+    - name: beta-handle
+      max_concurrency: 8
+    - name: issue-track
+      max_concurrency: 15
+
+# 日志
+log:
+  format: text
+  level: info
+
+# 认证：生产请开启 Builtin Auth + API Key
+# auth:
+#   ...

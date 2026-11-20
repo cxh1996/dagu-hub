@@ -1,0 +1,312 @@
+# Code Review 主编排 DAG（入口文档：name 由文件名决定，勿写 name 字段）
+# 派发到独立 Worker（role=code-review）；同 DAG 可并发多实例（不同仓库/PR）
+#
+# 能力对照：
+# - worker_selector / queue          → Worker 隔离 + 多实例
+# - preconditions + negate           → 条件判断
+# - parallel.items + dag.run         → 按文件并行
+# - repeat_policy                    → 循环等待
+# - depends: [a, b, c]               → 多输入汇聚
+
+type: graph
+description: |
+  PR Code Review 流水线（约 7 个大步骤）。
+  执行面：独立 Worker；控制面：主 Dagu Web UI / API。
+tags:
+  - code-review
+  - worker
+
+worker_selector:
+  role: code-review
+
+queue: code-review
+timeout_sec: 7200
+max_active_steps: 6
+
+params:
+  - name: repo
+    type: string
+    required: true
+    default: ""
+    description: GitHub org/repo
+  - name: pr_number
+    type: string
+    required: true
+    default: ""
+    description: Pull request number
+  - name: base_branch
+    type: string
+    default: main
+  - name: head_sha
+    type: string
+    default: ""
+  - name: review_mode
+    type: string
+    enum: [full, quick, security-only]
+    default: full
+    description: full | quick | security-only
+  - name: enable_security
+    type: string
+    default: "true"
+  - name: notify_feishu
+    type: string
+    default: "true"
+  - name: feishu_chat_id
+    type: string
+    default: ""
+
+env:
+  - BIZ: code-review
+  - RUN_RECORD_DIR: ${WORKER_DATA_DIR}/runs/${context.run.id}
+  - SCRIPTS: ${SCRIPTS_DIR}
+  - repo: ${params.repo}
+  - pr_number: ${params.pr_number}
+  - base_branch: ${params.base_branch}
+  - head_sha: ${params.head_sha}
+  - review_mode: ${params.review_mode}
+  - enable_security: ${params.enable_security}
+  - notify_feishu: ${params.notify_feishu}
+  - feishu_chat_id: ${params.feishu_chat_id}
+
+handler_on:
+  success:
+    run: |
+      bash "${SCRIPTS}/persist_run.sh" --status succeeded
+  failure:
+    run: |
+      bash "${SCRIPTS}/persist_run.sh" --status failed
+      bash "${SCRIPTS}/notify_feishu.sh" --event failure || true
+  exit:
+    run: |
+      bash "${SCRIPTS}/cleanup_workspace.sh" || true
+
+steps:
+  # ── 1. 校验与准备 ───────────────────────────────────
+  - id: validate_params
+    name: validate_params
+    description: "1.1 校验入参"
+    run: |
+      bash "${SCRIPTS}/01_validate_params.sh"
+    outputs:
+      - name: validate_json
+
+  - id: prepare_workspace
+    name: prepare_workspace
+    description: "1.2 创建本 Worker 运行目录"
+    depends: [validate_params]
+    run: |
+      bash "${SCRIPTS}/01_prepare_workspace.sh"
+    outputs:
+      - name: workspace
+
+  - id: checkout_pr
+    name: checkout_pr
+    description: "1.3 拉取 PR 代码"
+    depends: [prepare_workspace]
+    run: |
+      bash "${SCRIPTS}/01_checkout_pr.sh"
+    retry_policy:
+      limit: 3
+      interval_sec: 5
+      backoff: 2.0
+      max_interval_sec: 60
+    outputs:
+      - name: checkout_meta
+
+  # ── 2. 采集 Diff ────────────────────────────────────
+  - id: collect_diff
+    name: collect_diff
+    description: "2.1 收集 PR diff"
+    depends: [checkout_pr]
+    run: |
+      bash "${SCRIPTS}/02_collect_diff.sh"
+    outputs:
+      - name: diff_meta
+
+  - id: filter_paths
+    name: filter_paths
+    description: "2.2 过滤无关路径，产出并行文件列表"
+    depends: [collect_diff]
+    run: |
+      bash "${SCRIPTS}/02_filter_paths.sh"
+    outputs:
+      - name: file_list
+
+  - id: summarize_diff
+    name: summarize_diff
+    description: "2.3 生成 diff 摘要"
+    depends: [filter_paths]
+    run: |
+      bash "${SCRIPTS}/02_summarize_diff.sh"
+    outputs:
+      - name: diff_summary
+
+  # ── 3. 静态分析（并行 + 条件） ──────────────────────
+  - id: run_lint
+    name: run_lint
+    description: "3.1 Lint（quick 模式跳过）"
+    depends: [summarize_diff]
+    preconditions:
+      - condition: "${params.review_mode}"
+        expected: "quick"
+        negate: true
+    continue_on:
+      skipped: true
+      failure: true
+    run: |
+      bash "${SCRIPTS}/03_run_lint.sh"
+    outputs:
+      - name: lint_result
+
+  - id: run_typecheck
+    name: run_typecheck
+    description: "3.2 类型检查（与 lint 并行）"
+    depends: [summarize_diff]
+    preconditions:
+      - condition: "${params.review_mode}"
+        expected: "quick"
+        negate: true
+    continue_on:
+      skipped: true
+      failure: true
+    run: |
+      bash "${SCRIPTS}/03_run_typecheck.sh"
+    outputs:
+      - name: typecheck_result
+
+  - id: secret_scan
+    name: secret_scan
+    description: "3.3 密钥扫描（始终执行）"
+    depends: [summarize_diff]
+    run: |
+      bash "${SCRIPTS}/03_secret_scan.sh"
+    outputs:
+      - name: secret_scan_result
+
+  # ── 4. 按文件并行评审 ───────────────────────────────
+  - id: review_files
+    name: review_files
+    description: "4.x 按变更文件并行评审"
+    depends: [filter_paths, secret_scan]
+    action: dag.run
+    with:
+      dag: code-review-file-review
+      params:
+        repo: ${params.repo}
+        pr_number: ${params.pr_number}
+        file: ${ITEM}
+        review_mode: ${params.review_mode}
+        workspace: ${prepare_workspace.outputs.workspace}
+    parallel:
+      items: ${filter_paths.outputs.file_list}
+      max_concurrent: 4
+
+  # ── 5. 安全与合规（条件 + 循环） ────────────────────
+  - id: security_review
+    name: security_review
+    description: "5.1 安全深度评审"
+    depends: [review_files]
+    preconditions:
+      - condition: "${params.enable_security}"
+        expected: "true"
+    continue_on:
+      skipped: true
+    run: |
+      bash "${SCRIPTS}/05_security_review.sh"
+    outputs:
+      - name: security_result
+
+  - id: wait_policy_ready
+    name: wait_policy_ready
+    description: "5.2 轮询合规策略就绪（repeat）"
+    depends: [security_review]
+    preconditions:
+      - condition: "${params.review_mode}"
+        expected: "full"
+    continue_on:
+      skipped: true
+    run: |
+      bash "${SCRIPTS}/05_check_policy_ready.sh"
+    repeat_policy:
+      repeat: until
+      exit_code: [0]
+      interval_sec: 10
+      backoff: 1.5
+      max_interval_sec: 60
+      limit: 12
+    outputs:
+      - name: policy_ready
+
+  - id: license_check
+    name: license_check
+    description: "5.3 License / 依赖合规"
+    depends: [wait_policy_ready]
+    continue_on:
+      skipped: true
+      failure: true
+    run: |
+      bash "${SCRIPTS}/05_license_check.sh"
+    outputs:
+      - name: license_result
+
+  # ── 6. 多输入汇聚 ───────────────────────────────────
+  - id: aggregate_findings
+    name: aggregate_findings
+    description: "6.1 汇聚 lint / 文件评审 / 安全 / 合规结果"
+    depends:
+      - run_lint
+      - run_typecheck
+      - secret_scan
+      - review_files
+      - security_review
+      - license_check
+    run: |
+      bash "${SCRIPTS}/06_aggregate_findings.sh"
+    outputs:
+      - name: aggregate_json
+
+  - id: score_risk
+    name: score_risk
+    description: "6.2 风险评分"
+    depends: [aggregate_findings]
+    run: |
+      bash "${SCRIPTS}/06_score_risk.sh"
+    outputs:
+      - name: risk_score
+
+  # ── 7. 发布报告 ─────────────────────────────────────
+  - id: render_report
+    name: render_report
+    description: "7.1 渲染 Markdown 报告"
+    depends: [score_risk]
+    run: |
+      bash "${SCRIPTS}/07_render_report.sh"
+    outputs:
+      - name: report_path
+
+  - id: post_pr_comment
+    name: post_pr_comment
+    description: "7.2 回写 PR Comment"
+    depends: [render_report]
+    run: |
+      bash "${SCRIPTS}/07_post_pr_comment.sh"
+    retry_policy:
+      limit: 3
+      interval_sec: 5
+      exit_code: [1, 22, 28]
+    outputs:
+      - name: comment_url
+
+  - id: notify_feishu
+    name: notify_feishu
+    description: "7.3 飞书通知（可关）"
+    depends: [render_report, post_pr_comment]
+    preconditions:
+      - condition: "${params.notify_feishu}"
+        expected: "true"
+    continue_on:
+      skipped: true
+    run: |
+      bash "${SCRIPTS}/notify_feishu.sh" --event success
+    outputs:
+      - name: feishu_msg_id

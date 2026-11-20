@@ -1,0 +1,14 @@
+node_modules/
+# 主实例运行时数据（本地生成）
+/data/
+# Worker 业务数据 / 日志（保留目录占位）
+workers/*/data/*
+!workers/*/data/.gitkeep
+workers/*/logs/*
+!workers/*/logs/.gitkeep
+*.log
+.pm2/
+.DS_Store
+.env
+.env.*
+!.env.example

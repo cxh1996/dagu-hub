@@ -1,0 +1,29 @@
+# 知识库构建占位 DAG —— 后续按同样模式落地
+# 入口文档：勿写 name（由文件名决定）
+
+type: graph
+description: Placeholder for knowledge-base build pipeline
+tags:
+  - knowledge
+  - placeholder
+
+worker_selector:
+  role: knowledge-build
+
+queue: knowledge-build
+
+params:
+  - name: corpus_id
+    type: string
+    default: ""
+  - name: source_uri
+    type: string
+    default: ""
+
+steps:
+  - id: todo
+    name: todo
+    run: |
+      echo "TODO: implement knowledge-build on worker role=knowledge-build"
+      echo "corpus_id=${params.corpus_id} source_uri=${params.source_uri}"
+      echo "data_dir=${WORKER_DATA_DIR}"
